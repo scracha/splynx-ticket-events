@@ -1,0 +1,5 @@
+config.php
+state.json
+pending_transcriptions.json
+events.log
+*.tmp

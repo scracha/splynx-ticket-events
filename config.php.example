@@ -1,0 +1,74 @@
+<?php
+// ============================================================
+// Splynx Ticket Events — Configuration
+// ============================================================
+
+// --- Splynx API ---
+$splynxBaseUrl = 'https://your-splynx-instance.example.com/api/2.0';
+$splynxAdminUrl = 'https://your-splynx-instance.example.com';
+$apiKey = 'your_splynx_api_key';
+$apiSecret = 'your_splynx_api_secret';
+
+// --- State & Logging ---
+$stateFile = __DIR__ . '/state.json';
+$logFile = __DIR__ . '/events.log';
+
+// --- Polling ---
+$pollLookbackMinutes = 5;  // Fallback lookback on first run
+
+// --- Ticket Filtering ---
+// Ignore tickets created by admins (reporter_type = 'admin')
+// Leave empty to ignore ALL admin-created tickets, or list specific IDs
+$ignoreAdminCreators = [];
+
+// Ignore tickets created by API keys (reporter_type = 'api')
+$ignoreApiCreators = [];
+
+// Ignore tickets from specific incoming customers (e.g. mailer-daemon)
+$ignoreIncomingCustomerIds = [];
+
+// ============================================================
+// Handler Configuration
+// ============================================================
+
+// Enable/disable handlers
+$handlers = [
+    'transcribe'     => true,
+    'match_customer' => true,
+    'slack'          => true,
+];
+
+// --- Slack Handler ---
+$slackWebhookUrl = 'https://hooks.slack.com/services/YOUR/WEBHOOK/URL';
+
+// Strings to strip from Slack message previews
+$excludeStrings = [];
+
+// --- Transcribe Handler ---
+// Google AI Studio (preferred)
+$googleAIStudioKey = 'your_google_ai_studio_key';
+
+// OpenAI Whisper (fallback if Google key is empty)
+$openAIKey = '';
+
+// Audio file extensions to transcribe
+$audioExtensions = ['wav', 'mp3', 'mp4', 'mpeg', 'mpga', 'm4a', 'webm', 'ogg', 'flac'];
+
+// Max audio file size (bytes) — 25MB
+$maxAudioSize = 25 * 1024 * 1024;
+
+// Admin ID to post transcription notes as
+$noteAuthorId = 1;
+
+// Prefix for transcription notes
+$notePrefix = '📝 Voicemail Transcription';
+
+// --- Match Customer Handler ---
+// Customer IDs that should be treated as "unassigned" (e.g. 2Talk Limited)
+// Tickets assigned to these will be re-matched to the real customer
+$matchGenericCustomerIds = [
+    // 1632,  // 2Talk Limited
+];
+
+// Subject pattern to identify voicemail tickets (regex)
+$matchSubjectPattern = '/voicemail|voice message/i';
