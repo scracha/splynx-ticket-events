@@ -3,3 +3,7 @@ state.json
 pending_transcriptions.json
 events.log
 *.tmp
+*.bak
+*.ps1
+all_code_context.txt
+payload.json

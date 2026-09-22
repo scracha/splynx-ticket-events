@@ -41,12 +41,14 @@ return function (array &$event, SplynxApiClient $api) {
         $transcription = implode("\n", $parts);
     }
 
-    // Include customer match info if available (from match_customer handler)
+    // Include customer match info or suggested match warning
     $customerMatch = '';
     if (!empty($event['customer_matched'])) {
         $cm = $event['customer_matched'];
-        $customerName = $cm['customer_name']; // Override the generic name
-        $customerMatch = "Matched via {$cm['method']}";
+        $customerName = $cm['customer_name']; // Override generic name
+        $customerMatch = "🎯 Auto-assigned: {$cm['method']}";
+    } elseif (!empty($event['customer_match_warning'])) {
+        $customerMatch = "💡 {$event['customer_match_warning']}";
     }
 
     // Determine action label
@@ -145,7 +147,7 @@ function sendSlackNotification(string $action, int $ticketId, string $subject, s
 
     $text = "{$icon} *{$action}* — <{$ticketUrl}|#{$ticketId} {$subject}>\n*Customer:* {$customer}";
     if ($customerMatch) {
-        $text .= " _(auto-assigned: {$customerMatch})_";
+        $text .= "\n_{$customerMatch}_";
     }
     if ($transcription) {
         $text .= "\n:studio_microphone: *Voicemail Transcription:*\n>>> " . $transcription;

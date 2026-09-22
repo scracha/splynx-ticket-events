@@ -5,8 +5,11 @@
  * Detects audio attachments on new tickets, transcribes them,
  * and posts the transcription as an admin note on the ticket.
  *
- * If transcription fails (e.g. API rate limit), queues for retry on next poll.
- * On successful retry, posts the note and sends a follow-up Slack message.
+ * Fallback hierarchy:
+ *   1. Preferred provider ($transcribeProvider = 'google' or 'groq')
+ *   2. Secondary fallback provider
+ *   3. OpenAI Whisper
+ *   4. Queue for retry (up to 3 attempts)
  *
  * Events handled: new_ticket only
  */
@@ -15,7 +18,6 @@ define('PENDING_FILE', __DIR__ . '/../pending_transcriptions.json');
 define('MAX_RETRIES', 3);
 
 return function (array &$event, SplynxApiClient $api) {
-    // Only transcribe on new tickets (not replies, to avoid re-processing)
     if ($event['type'] !== 'new_ticket') return;
 
     global $audioExtensions, $maxAudioSize, $splynxBaseUrl, $notePrefix, $noteAuthorId;
@@ -23,7 +25,6 @@ return function (array &$event, SplynxApiClient $api) {
     $ticket = $event['ticket'];
     $ticketId = $ticket['id'];
 
-    // Find audio attachments
     $audioFiles = findAudioAttachments($api, $ticketId);
     if (empty($audioFiles)) return;
 
@@ -33,7 +34,6 @@ return function (array &$event, SplynxApiClient $api) {
         $transcription = attemptTranscription($api, $ticketId, $audio);
 
         if ($transcription !== false) {
-            // Success — enrich event for Slack handler
             if (!isset($event['transcriptions'])) {
                 $event['transcriptions'] = [];
             }
@@ -43,37 +43,29 @@ return function (array &$event, SplynxApiClient $api) {
             ];
             postTranscriptionNote($api, $ticketId, $audio['filename'], $transcription);
         } else {
-            // Failed — queue for retry
             queueForRetry($ticketId, $audio, $ticket['subject'] ?? '');
             logMsg("Transcribe: Ticket #{$ticketId} — queued {$audio['filename']} for retry");
         }
     }
 };
 
-/**
- * Attempt to download and transcribe an audio file.
- * Returns transcription text or false on failure.
- */
-function attemptTranscription(SplynxApiClient $api, int $ticketId, array $audio)
+function attemptTranscription(SplynxApiClient $api, int $ticketId, array $audio, ?string $preferredProvider = null)
 {
     $filename = $audio['filename'];
     $url = $audio['url'];
 
-    // Download
     $fileContent = $api->downloadFile($url);
     if ($fileContent === false || empty($fileContent)) {
         logMsg("Transcribe: Ticket #{$ticketId} — failed to download {$filename}");
         return false;
     }
 
-    // Save to temp file
     $tmpFile = sys_get_temp_dir() . '/transcribe_' . getmypid() . '_' . basename($filename);
     file_put_contents($tmpFile, $fileContent);
 
     logMsg("Transcribe: Ticket #{$ticketId} — transcribing {$filename} (" . round(strlen($fileContent) / 1024, 1) . "KB)");
 
-    // Transcribe
-    $transcription = transcribeAudioFile($tmpFile, $filename);
+    $transcription = transcribeAudioFile($tmpFile, $filename, $preferredProvider);
     @unlink($tmpFile);
 
     if ($transcription === false || empty($transcription)) {
@@ -85,9 +77,6 @@ function attemptTranscription(SplynxApiClient $api, int $ticketId, array $audio)
     return $transcription;
 }
 
-/**
- * Post transcription as an admin note on the ticket.
- */
 function postTranscriptionNote(SplynxApiClient $api, int $ticketId, string $filename, string $transcription)
 {
     global $notePrefix, $noteAuthorId;
@@ -109,9 +98,6 @@ function postTranscriptionNote(SplynxApiClient $api, int $ticketId, string $file
     }
 }
 
-/**
- * Queue a failed transcription for retry on next poll run.
- */
 function queueForRetry(int $ticketId, array $audio, string $subject)
 {
     $pending = loadPending();
@@ -134,15 +120,10 @@ function queueForRetry(int $ticketId, array $audio, string $subject)
     savePending($pending);
 }
 
-/**
- * Process pending retries. Called from poll.php after main event dispatch.
- */
 function processRetries(SplynxApiClient $api)
 {
     $pending = loadPending();
     if (empty($pending)) return;
-
-    global $slackWebhookUrl, $splynxAdminUrl;
 
     $completed = [];
 
@@ -164,18 +145,16 @@ function processRetries(SplynxApiClient $api)
         $transcription = attemptTranscription($api, $item['ticket_id'], $audio);
 
         if ($transcription !== false) {
-            // Success! Post note and send Slack follow-up
             postTranscriptionNote($api, $item['ticket_id'], $item['filename'], $transcription);
             sendTranscriptionSlack($item['ticket_id'], $item['subject'], $item['filename'], $transcription);
+            triggerDelayedCustomerMatch($api, $item['ticket_id'], $item['subject'], $transcription);
             $completed[] = $key;
         } else {
-            // Still failing — increment attempt count
             $pending[$key]['attempts']++;
             $pending[$key]['last_attempt'] = date('Y-m-d H:i:s');
         }
     }
 
-    // Remove completed/given-up items
     foreach ($completed as $key) {
         unset($pending[$key]);
     }
@@ -183,9 +162,32 @@ function processRetries(SplynxApiClient $api)
     savePending($pending);
 }
 
-/**
- * Send a follow-up Slack message with the transcription (for retried items).
- */
+function triggerDelayedCustomerMatch(SplynxApiClient $api, int $ticketId, string $subject, string $transcription): void
+{
+    global $handlers;
+    if (empty($handlers['match_customer'])) return;
+
+    $matchHandlerFile = __DIR__ . '/match_customer.php';
+    if (!file_exists($matchHandlerFile)) return;
+
+    $ticket = $api->get("admin/support/tickets/{$ticketId}");
+    if (!$ticket) return;
+
+    $event = [
+        'type'           => 'new_ticket',
+        'ticket'         => $ticket,
+        'transcriptions' => [
+            ['filename' => 'audio_retry', 'text' => $transcription]
+        ]
+    ];
+
+    $matcher = require $matchHandlerFile;
+    if (is_callable($matcher)) {
+        logMsg("Transcribe: Triggering delayed customer matching for ticket #{$ticketId}");
+        $matcher($event, $api);
+    }
+}
+
 function sendTranscriptionSlack(int $ticketId, string $subject, string $filename, string $transcription)
 {
     global $slackWebhookUrl, $splynxAdminUrl;
@@ -222,10 +224,6 @@ function sendTranscriptionSlack(int $ticketId, string $subject, string $filename
     }
 }
 
-// ============================================================
-// Pending file helpers
-// ============================================================
-
 function loadPending(): array
 {
     if (!file_exists(PENDING_FILE)) return [];
@@ -238,17 +236,6 @@ function savePending(array $pending)
     file_put_contents(PENDING_FILE, json_encode($pending, JSON_PRETTY_PRINT));
 }
 
-// ============================================================
-// Audio detection & transcription functions
-// ============================================================
-
-/**
- * Find audio attachments in a ticket's messages.
- * Splynx stores attachments in a 'files' array on each message with:
- *   - filename_original: the real filename
- *   - download_link: URL to download the file
- *   - id: file ID
- */
 function findAudioAttachments(SplynxApiClient $api, int $ticketId): array
 {
     global $audioExtensions, $maxAudioSize;
@@ -290,29 +277,43 @@ function findAudioAttachments(SplynxApiClient $api, int $ticketId): array
     return $audioFiles;
 }
 
-/**
- * Transcribe an audio file. Prefers Google AI Studio, falls back to OpenAI.
- */
-function transcribeAudioFile(string $filePath, string $fileName)
+function transcribeAudioFile(string $filePath, string $fileName, ?string $preferredProvider = null)
 {
-    global $googleAIStudioKey, $openAIKey;
+    global $googleAIStudioKey, $groqApiKey, $openAIKey, $transcribeProvider;
 
-    if (!empty($googleAIStudioKey)) {
-        $result = transcribeWithGoogleAI($filePath, $fileName, $googleAIStudioKey);
-        if ($result !== false) return $result;
+    $primary = $preferredProvider ?: ($transcribeProvider ?? 'google');
+
+    if ($primary === 'groq') {
+        if (!empty($groqApiKey)) {
+            $result = transcribeWithGroq($filePath, $fileName, $groqApiKey);
+            if ($result !== false) return $result;
+        }
+        if (!empty($googleAIStudioKey)) {
+            logMsg("Transcribe: Groq failed, falling back to Google AI...");
+            $result = transcribeWithGoogleAI($filePath, $fileName, $googleAIStudioKey);
+            if ($result !== false) return $result;
+        }
+    } else {
+        if (!empty($googleAIStudioKey)) {
+            $result = transcribeWithGoogleAI($filePath, $fileName, $googleAIStudioKey);
+            if ($result !== false) return $result;
+        }
+        if (!empty($groqApiKey)) {
+            logMsg("Transcribe: Google AI failed, falling back to Groq Whisper...");
+            $result = transcribeWithGroq($filePath, $fileName, $groqApiKey);
+            if ($result !== false) return $result;
+        }
     }
 
     if (!empty($openAIKey)) {
+        logMsg("Transcribe: Falling back to OpenAI Whisper...");
         return transcribeWithOpenAI($filePath, $fileName, $openAIKey);
     }
 
-    logMsg("Transcribe: No API key configured");
+    logMsg("Transcribe: No fallback API key configured");
     return false;
 }
 
-/**
- * Transcribe using Google AI Studio (Gemini 2.5 Flash).
- */
 function transcribeWithGoogleAI(string $filePath, string $fileName, string $apiKey)
 {
     $fileContent = file_get_contents($filePath);
@@ -377,9 +378,46 @@ function transcribeWithGoogleAI(string $filePath, string $fileName, string $apiK
     return trim($text);
 }
 
-/**
- * Transcribe using OpenAI Whisper API.
- */
+function transcribeWithGroq(string $filePath, string $fileName, string $apiKey)
+{
+    $url = 'https://api.groq.com/openai/v1/audio/transcriptions';
+    $cFile = new CURLFile($filePath, mime_content_type($filePath) ?: 'audio/mpeg', $fileName);
+
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => [
+            'file'            => $cFile,
+            'model'           => 'whisper-large-v3',
+            'response_format' => 'json'
+        ],
+        CURLOPT_HTTPHEADER => [
+            'Authorization: Bearer ' . $apiKey
+        ],
+        CURLOPT_TIMEOUT => 60,
+    ]);
+
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+
+    if ($response === false) {
+        logMsg("Transcribe: Groq cURL error: $curlError");
+        return false;
+    }
+
+    if ($httpCode !== 200) {
+        logMsg("Transcribe: Groq error (HTTP $httpCode): " . substr($response, 0, 200));
+        return false;
+    }
+
+    $result = json_decode($response, true);
+    return $result['text'] ?? false;
+}
+
 function transcribeWithOpenAI(string $filePath, string $fileName, string $apiKey)
 {
     $url = 'https://api.openai.com/v1/audio/transcriptions';
