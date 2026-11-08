@@ -3,7 +3,7 @@
 /**
  * Splynx Ticket Event Dispatcher
  *
- * Single poller that detects new tickets and customer replies,
+ * Single poller that detects new tickets, customer replies, and agent assignments,
  * then dispatches events to registered handlers.
  *
  * Run via cron every 1-2 minutes:
@@ -12,6 +12,7 @@
  * Events dispatched:
  *   - new_ticket: A customer created a new ticket
  *   - customer_reply: A customer replied to an existing ticket
+ *   - ticket_assigned: A ticket was assigned or reassigned to an agent
  */
 
 require_once __DIR__ . '/config.php';
@@ -67,6 +68,7 @@ if (empty($tickets)) {
 }
 
 $events = [];
+$now = time();
 
 foreach ($tickets as $ticket) {
     $id = $ticket['id'] ?? null;
@@ -75,14 +77,19 @@ foreach ($tickets as $ticket) {
     $updatedAt = $ticket['updated_at'] ?? '';
     $createdAt = $ticket['created_at'] ?? '';
     $unreadByAdmin = (int)($ticket['unread_by_admin'] ?? 0);
+    $currentAssignee = trim((string)($ticket['assigned_to'] ?? ($ticket['assign_to'] ?? '')));
     $stateKey = "ticket_{$id}";
     $prevState = $state[$stateKey] ?? null;
 
-    // --- New ticket (never seen before) ---
+    // --- New ticket (never seen before in current open state) ---
     if ($prevState === null) {
-        $createdTime = strtotime($createdAt);
-        if ($createdTime && (time() - $createdTime) < $lookbackSeconds) {
-            // Skip admin/API-created and ignored incoming customers
+        $createdTime    = strtotime($createdAt);
+        $updatedTime    = strtotime($updatedAt);
+        $isFreshCreated = ($createdTime && ($now - $createdTime) < $lookbackSeconds);
+        $isFreshUpdated = ($updatedTime && ($now - $updatedTime) < $lookbackSeconds);
+
+        // Truly new ticket → full pipeline (transcribe, match, general Slack channel)
+        if ($isFreshCreated) {
             if (!isIgnoredTicket($ticket)) {
                 $events[] = [
                     'type'   => 'new_ticket',
@@ -90,9 +97,24 @@ foreach ($tickets as $ticket) {
                 ];
             }
         }
+
+        // New OR reopened assigned ticket → agent DM alert
+        if (($isFreshCreated || $isFreshUpdated)
+            && !empty($currentAssignee)
+            && $currentAssignee !== 'Unassigned'
+            && $currentAssignee !== '0') {
+            $events[] = [
+                'type'          => 'ticket_assigned',
+                'ticket'        => $ticket,
+                'prev_assignee' => null,
+                'assignee'      => $currentAssignee,
+            ];
+        }
+
         $state[$stateKey] = [
             'updated_at'      => $updatedAt,
             'unread_by_admin' => $unreadByAdmin,
+            'assigned_to'     => $currentAssignee,
         ];
         continue;
     }
@@ -106,15 +128,35 @@ foreach ($tickets as $ticket) {
         ];
     }
 
+    // --- Ticket assigned or reassigned ---
+    // Requires 'assigned_to' to pre-exist in prevState (migration-safe against deploy storms)
+    // and verifies that the ticket was recently updated
+    $updatedTime = strtotime($updatedAt);
+    $isRecentlyUpdated = ($updatedTime && ($now - $updatedTime) < $lookbackSeconds);
+
+    if (array_key_exists('assigned_to', $prevState)
+        && !empty($currentAssignee)
+        && $currentAssignee !== 'Unassigned'
+        && $currentAssignee !== '0'
+        && $currentAssignee !== ($prevState['assigned_to'] ?? '')
+        && $isRecentlyUpdated) {
+        $events[] = [
+            'type'          => 'ticket_assigned',
+            'ticket'        => $ticket,
+            'prev_assignee' => $prevState['assigned_to'] ?? null,
+            'assignee'      => $currentAssignee,
+        ];
+    }
+
     $state[$stateKey] = [
         'updated_at'      => $updatedAt,
         'unread_by_admin' => $unreadByAdmin,
+        'assigned_to'     => $currentAssignee,
     ];
 }
 
 // --- Dispatch events to handlers ---
 // Handlers receive $event by reference so earlier handlers can enrich it
-// (e.g. transcribe adds transcription text, slack includes it in notification)
 $dispatched = 0;
 foreach ($events as &$event) {
     $ticketId = $event['ticket']['id'];
@@ -123,7 +165,7 @@ foreach ($events as &$event) {
     foreach ($activeHandlers as $name => $handler) {
         try {
             $handler($event, $api);
-        } catch (Exception $e) {
+        } catch (Throwable $e) {
             logMsg("ERROR: Handler '{$name}' failed on ticket #{$ticketId} ({$type}): " . $e->getMessage());
         }
     }
@@ -227,5 +269,5 @@ function logMsg(string $msg): void
     $ts = date('Y-m-d H:i:s');
     $line = "[{$ts}] {$msg}\n";
     file_put_contents($logFile, $line, FILE_APPEND);
-    echo $line;
+    // Note: avoided echo here to prevent duplicate log entries when cron redirects stdout (>> events.log)
 }

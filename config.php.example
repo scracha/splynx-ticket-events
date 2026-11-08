@@ -28,12 +28,23 @@ $ignoreIncomingCustomerIds = [];
 $handlers = [
     'transcribe'     => true,
     'match_customer' => true,
-    'slack'          => true,
+    'slack'          => true,         // General channel alerts (new tickets, customer replies)
+    'slack_assign'   => true,         // Direct message alerts to assigned agents
 ];
 
-// --- Slack Handler ---
+// --- Slack General Channel Handler ---
 $slackWebhookUrl = 'https://hooks.slack.com/services/YOUR/WEBHOOK/URL';
 $excludeStrings = [];
+
+// --- Slack Agent Direct Message Handler (slack_assign) ---
+// Bot User OAuth Token with 'chat:write' scope (xoxb-...)
+$slackBotToken = 'xoxb-your-bot-token-here';
+
+// Map of Splynx administrator IDs to Slack Member IDs (e.g. U012345678)
+$slackAgentUsers = [
+    '3' => 'U012345678',
+    '9'     => 'U876543210',
+];
 
 // --- Transcribe Handler ---
 // Primary provider: 'google' or 'groq'

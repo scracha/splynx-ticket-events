@@ -2,7 +2,7 @@
 /**
  * Slack Notification Handler
  *
- * Sends Slack notifications for new tickets and customer replies.
+ * Sends Slack notifications to a central channel for new tickets and customer replies.
  * Replaces the standalone splynx-slack-poller.
  *
  * Events handled: new_ticket, customer_reply
@@ -10,6 +10,11 @@
 
 return function (array &$event, SplynxApiClient $api) {
     global $slackWebhookUrl, $splynxAdminUrl, $excludeStrings;
+
+    // Guard: only handle new tickets and customer replies (ignore ticket_assigned)
+    if (!in_array($event['type'], ['new_ticket', 'customer_reply'], true)) {
+        return;
+    }
 
     if (empty($slackWebhookUrl) || strpos($slackWebhookUrl, 'YOUR') !== false) {
         return;
@@ -23,15 +28,12 @@ return function (array &$event, SplynxApiClient $api) {
     $customerId = $ticket['customer_id'] ?? null;
     $time = ($type === 'new_ticket') ? ($ticket['created_at'] ?? '') : ($ticket['updated_at'] ?? '');
 
-    // Resolve customer name
     $customerName = ($customerId && $customerId != 0) ? 'Customer #' . $customerId : 'Unknown Customer';
     $resolved = getCustomerNameForSlack($api, $customerId);
     if ($resolved) $customerName = $resolved;
 
-    // Get message preview
     $preview = getTicketPreviewForSlack($api, $id, 200, ($type === 'customer_reply'));
 
-    // Include transcription if available (from transcribe handler)
     $transcription = '';
     if (!empty($event['transcriptions'])) {
         $parts = [];
@@ -41,29 +43,21 @@ return function (array &$event, SplynxApiClient $api) {
         $transcription = implode("\n", $parts);
     }
 
-    // Include customer match info or suggested match warning
     $customerMatch = '';
     if (!empty($event['customer_matched'])) {
         $cm = $event['customer_matched'];
-        $customerName = $cm['customer_name']; // Override generic name
+        $customerName = $cm['customer_name'];
         $customerMatch = "🎯 Auto-assigned: {$cm['method']}";
     } elseif (!empty($event['customer_match_warning'])) {
         $customerMatch = "💡 {$event['customer_match_warning']}";
     }
 
-    // Determine action label
     $action = ($type === 'new_ticket') ? 'New' : 'Customer Reply';
 
-    // Send to Slack
     sendSlackNotification($action, $id, $subject, $customerName, $priority, $time, $splynxAdminUrl, $preview, $transcription, $customerMatch);
 
     logMsg("Slack: Sent '{$action}' notification for ticket #{$id}");
-
 };
-
-// ============================================================
-// Slack Helper Functions
-// ============================================================
 
 function getCustomerNameForSlack(SplynxApiClient $api, $customerId): ?string
 {
@@ -87,27 +81,23 @@ function getTicketPreviewForSlack(SplynxApiClient $api, int $ticketId, int $maxC
     $msg = $lastMessage ? end($msgs) : reset($msgs);
     $body = $msg['message'] ?? '';
 
-    // Convert block-level HTML to newlines before stripping
     $body = preg_replace('/<br\s*\/?>/i', "\n", $body);
     $body = preg_replace('/<\/(div|p|li|tr|h[1-6])>/i', "\n", $body);
     $body = preg_replace('/<(div|p|li|tr|h[1-6])[^>]*>/i', '', $body);
     $body = html_entity_decode(strip_tags($body), ENT_QUOTES, 'UTF-8');
-    $body = str_replace("\xC2\xA0", ' ', $body);
+    $body = str_replace(chr(194) . chr(160), ' ', $body);
     $body = str_replace(["\r\n", "\r"], "\n", $body);
 
-    // Remove excluded strings
     if (!empty($excludeStrings)) {
         foreach ($excludeStrings as $exclude) {
             $body = str_replace($exclude, '', $body);
         }
     }
 
-    // Split, trim, collapse
     $lines = array_filter(array_map(function($l) {
         return preg_replace('/\s+/', ' ', trim($l));
     }, explode("\n", $body)), fn($l) => $l !== '');
 
-    // Join with punctuation logic
     $text = '';
     $prevLine = '';
     foreach ($lines as $line) {
@@ -145,7 +135,9 @@ function sendSlackNotification(string $action, int $ticketId, string $subject, s
     $icon = $emoji[strtolower($priority)] ?? ':white_circle:';
     $ticketUrl = rtrim($adminUrl, '/') . "/admin/tickets/opened--view?id={$ticketId}";
 
-    $text = "{$icon} *{$action}* — <{$ticketUrl}|#{$ticketId} {$subject}>\n*Customer:* {$customer}";
+    $title = preg_match('/^#\d+\b/', $subject) ? $subject : "#{$ticketId} {$subject}";
+
+    $text = "{$icon} *{$action}* — <{$ticketUrl}|{$title}>\n*Customer:* {$customer}";
     if ($customerMatch) {
         $text .= "\n_{$customerMatch}_";
     }
@@ -156,7 +148,7 @@ function sendSlackNotification(string $action, int $ticketId, string $subject, s
     }
 
     $payload = [
-        'text' => strip_tags("{$action}: #{$ticketId} {$subject} — {$customer}"),
+        'text' => strip_tags("{$action}: {$title} — {$customer}"),
         'blocks' => [
             ['type' => 'section', 'text' => ['type' => 'mrkdwn', 'text' => $text]],
             ['type' => 'context', 'elements' => [['type' => 'mrkdwn', 'text' => "_{$time}_"]]],

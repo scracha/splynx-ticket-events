@@ -196,7 +196,9 @@ function sendTranscriptionSlack(int $ticketId, string $subject, string $filename
 
     $ticketUrl = rtrim($splynxAdminUrl, '/') . "/admin/tickets/opened--view?id={$ticketId}";
 
-    $text = ":studio_microphone: *Voicemail Transcription* — <{$ticketUrl}|#{$ticketId} {$subject}>"
+    $title = preg_match('/^#\d+\b/', $subject) ? $subject : "#{$ticketId} {$subject}";
+
+    $text = ":studio_microphone: *Voicemail Transcription* — <{$ticketUrl}|{$title}>"
         . "\n_{$filename}_"
         . "\n>>> {$transcription}";
 
@@ -435,6 +437,7 @@ function transcribeWithOpenAI(string $filePath, string $fileName, string $apiKey
 
     $response = curl_exec($ch);
     $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
     curl_close($ch);
 
     if ($httpCode !== 200) {

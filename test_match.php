@@ -13,11 +13,9 @@
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/SplynxApiClient.php';
 
-// Load match_customer handler functions
 $handlerFile = __DIR__ . '/handlers/match_customer.php';
 require_once $handlerFile;
 
-// Load transcribe handler for audio/transcription functions
 require_once __DIR__ . '/handlers/transcribe.php';
 
 $ticketId = null;
@@ -51,7 +49,6 @@ if (!$ticketId) {
 
 $api = new SplynxApiClient($splynxBaseUrl, $apiKey, $apiSecret);
 
-// Fetch ticket
 $ticket = $api->get("admin/support/tickets/{$ticketId}");
 if (!$ticket) {
     die("Ticket #{$ticketId} not found\n");
@@ -74,7 +71,6 @@ if (!preg_match($pattern, $subject)) {
     echo "⚠ Subject does not match pattern: {$pattern}\n\n";
 }
 
-// Check data store
 if (!file_exists(MATCH_DATA_STORE)) {
     die("ERROR: Data store not found at " . MATCH_DATA_STORE . "\n");
 }
@@ -82,20 +78,16 @@ $rawStore = json_decode(file_get_contents(MATCH_DATA_STORE), true);
 $customers = aggregateCustomerStore($rawStore);
 echo "Data store loaded: " . count($rawStore) . " entries aggregated into " . count($customers) . " unique customers\n\n";
 
-// Get message body
 $firstMessageBody = getFirstTicketMessageBody($api, (int)$ticketId);
 
-// Extract caller ID
 $callerPhone = extractCallerId($subject, $firstMessageBody);
 echo "--- Caller ID Extraction ---\n";
 echo "  Extracted caller phone: " . ($callerPhone ?: '(none)') . "\n\n";
 
-// Audio & Transcription
 echo "--- Transcription Signals ---\n";
 $transcription = '';
 $transcriptionSource = '';
 
-// 1. Check cached note in Splynx if not forced
 if (!$forceLive) {
     $existingNotes = $api->get("admin/support/ticket-messages", [
         'main_attributes' => ['ticket_id' => $ticketId, 'message_type' => 'note'],
@@ -118,7 +110,6 @@ if (!$forceLive) {
     }
 }
 
-// 2. Download audio file if live run is needed or no note found
 if (empty($transcription) || $forceLive) {
     $audioFiles = findAudioAttachments($api, (int)$ticketId);
     if (empty($audioFiles)) {
@@ -140,11 +131,14 @@ if (empty($transcription) || $forceLive) {
                 $googleText = !empty($googleAIStudioKey) ? transcribeWithGoogleAI($tmpFile, $filename, $googleAIStudioKey) : false;
                 $groqText = !empty($groqApiKey) ? transcribeWithGroq($tmpFile, $filename, $groqApiKey) : false;
 
+                $googleDisplay = ($googleText !== false && $googleText !== '') ? $googleText : ($googleText === '' ? "(Empty / silent audio)" : "(Failed or quota exceeded)");
+                $groqDisplay = ($groqText !== false && $groqText !== '') ? $groqText : ($groqText === '' ? "(Empty / silent audio)" : "(Failed or key missing)");
+
                 echo "\n  [Google AI Studio (Gemini 2.5 Flash)]:\n";
-                echo "  \"" . ($googleText !== false ? $googleText : "(Failed or quota exceeded)") . "\"\n";
+                echo "  \"{$googleDisplay}\"\n";
 
                 echo "\n  [Groq Cloud (Whisper Large v3)]:\n";
-                echo "  \"" . ($groqText !== false ? $groqText : "(Failed or key missing)") . "\"\n";
+                echo "  \"{$groqDisplay}\"\n";
 
                 if ($preferGroq && $groqText !== false) {
                     $transcription = $groqText;
@@ -183,7 +177,6 @@ echo "Extracted Addresses: " . (empty($extractedAddresses) ? '(none)' : implode(
 $nameList = array_map(fn($n) => $n['name'] . ($n['is_full'] ? ' [Full]' : ' [First]'), $extractedNames);
 echo "Extracted Names: " . (empty($nameList) ? '(none)' : implode(', ', $nameList)) . "\n\n";
 
-// Score candidates
 echo "--- Scored Candidates ---\n";
 $candidates = scoreCustomerCandidates(
     $customers,
@@ -196,17 +189,22 @@ $candidates = scoreCustomerCandidates(
 $viable = array_filter($candidates, fn($c) => $c['confidence'] >= 65);
 usort($viable, fn($a, $b) => $b['confidence'] <=> $a['confidence']);
 
+$matchCount = count($viable);
+$simulatedPhone = $callerPhone ?: (!empty($transcribedPhones) ? $transcribedPhones[0] : null);
+
 if (empty($viable)) {
     echo "  No candidates met the minimum confidence threshold (>= 65%).\n";
     echo "  Result: UNKNOWN (Ticket remains unassigned).\n";
+    $simulatedSubject = buildVoicemailSubject($ticketId, null, null, null, $simulatedPhone);
+    echo "  Simulated Subject: \"{$simulatedSubject}\"\n";
 } else {
     foreach (array_values($viable) as $i => $c) {
-        echo "  [" . ($i + 1) . "] #{$c['customer_id']} {$c['customer_name']} — {$c['confidence']}% confidence\n";
+        $cName = !empty($c['customer_name']) ? $c['customer_name'] : "Customer #{$c['customer_id']}";
+        echo "  [" . ($i + 1) . "] #{$c['customer_id']} {$cName} — {$c['confidence']}% confidence\n";
         echo "      Reason: {$c['reason']}\n";
     }
 
     echo "\n--- Decision Simulation ---\n";
-    $matchCount = count($viable);
     $top = $viable[0];
     $topScore = $top['confidence'];
     $secondScore = $viable[1]['confidence'] ?? 0;
@@ -215,19 +213,33 @@ if (empty($viable)) {
     $isClearWinner = (!$isTied && $topScore >= 80 && ($topScore - $secondScore >= 10 || ($topScore >= 95 && $topScore - $secondScore >= 5)));
 
     if ($isClearWinner) {
-        echo "  ✓ AUTO-ASSIGN to {$top['customer_name']} (#{$top['customer_id']})\n";
+        $topName = !empty($top['customer_name']) ? $top['customer_name'] : "Customer #{$top['customer_id']}";
+        $topTown = $top['city'] ?? ($customers[$top['customer_id']]['city'] ?? null);
+        if (empty($topTown) || $topName === "Customer #{$top['customer_id']}") {
+            $custDetails = $api->get("admin/customers/customer/{$top['customer_id']}");
+            if (is_array($custDetails)) {
+                if (empty($topTown)) {
+                    $topTown = $custDetails['city'] ?? ($custDetails['billing_city'] ?? null);
+                }
+                if ($topName === "Customer #{$top['customer_id']}" && !empty($custDetails['name'])) {
+                    $topName = trim($custDetails['name'] . ' ' . ($custDetails['surname'] ?? ''));
+                }
+            }
+        }
+        $simulatedSubject = buildVoicemailSubject($ticketId, $topName, $top['matched_address'] ?? null, $topTown, $simulatedPhone);
+        echo "  ✓ AUTO-ASSIGN to {$topName} (#{$top['customer_id']})\n";
         echo "    Reason: {$topScore}% confidence via {$top['reason']}\n";
+        echo "    Simulated Subject: \"{$simulatedSubject}\"\n";
     } elseif ($matchCount >= 1 && $matchCount <= 3) {
+        $simulatedSubject = buildVoicemailSubject($ticketId, null, null, null, $simulatedPhone);
         echo "  ⚠ LEFT UNASSIGNED (Suggested Matches Note posted)\n";
         echo "    Up to 3 suggestions would be posted to the ticket for admin review.\n";
+        echo "    Simulated Subject: \"{$simulatedSubject}\"\n";
     } else {
+        $simulatedSubject = buildVoicemailSubject($ticketId, null, null, null, $simulatedPhone);
         echo "  ✗ LEFT UNASSIGNED as Unknown (> 3 matches: {$matchCount} candidates found)\n";
+        echo "    Simulated Subject: \"{$simulatedSubject}\"\n";
     }
 }
 
 echo "\nDone. (No changes were made to the ticket)\n";
-
-function logMsg(string $msg): void
-{
-    echo "[LOG] {$msg}\n";
-}

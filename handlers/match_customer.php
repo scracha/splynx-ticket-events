@@ -14,138 +14,27 @@
  *   - Alphanumeric house numbers (e.g. 368A vs 368)
  *   - Middle name and punctuation-tolerant name matching
  *   - Blacklist for 'anonymous', 'unknown', etc.
+ *   - Dynamic subject renaming:
+ *       Certain:   #<id> VOICEMAIL: caller NAME - street address, town [FROM number]
+ *       Unknown:   #<id> VOICEMAIL: caller unknown [FROM number]
  *
  * Events handled: new_ticket only (runs after transcribe handler)
  */
 
 define('MATCH_DATA_STORE', '/dev/shm/splynx_active_services.json');
 
-return function (array &$event, SplynxApiClient $api) {
-    if ($event['type'] !== 'new_ticket') return;
-
-    global $matchGenericCustomerIds, $matchSubjectPattern;
-
-    $ticket = $event['ticket'];
-    $ticketId = (int)$ticket['id'];
-    $customerId = (int)($ticket['customer_id'] ?? 0);
-    $subject = $ticket['subject'] ?? '';
-
-    // Only process if unassigned or generic
-    if ($customerId !== 0 && !in_array($customerId, $matchGenericCustomerIds ?? [])) {
-        return;
+// Fallback logMsg definition if required in isolation outside poll.php
+if (!function_exists('logMsg')) {
+    function logMsg(string $msg): void {
+        echo "[" . date('Y-m-d H:i:s') . "] {$msg}\n";
     }
-
-    $pattern = $matchSubjectPattern ?? '/voicemail|voice message/i';
-    if (!preg_match($pattern, $subject)) {
-        return;
-    }
-
-    logMsg("Match: Ticket #{$ticketId} — evaluating customer match candidates");
-
-    if (!file_exists(MATCH_DATA_STORE)) {
-        logMsg("Match: Data store not available at " . MATCH_DATA_STORE);
-        return;
-    }
-    $rawStore = json_decode(file_get_contents(MATCH_DATA_STORE), true);
-    if (empty($rawStore)) {
-        logMsg("Match: Data store is empty");
-        return;
-    }
-
-    // Aggregate store by unique customer_id (merging all services, phones, addresses)
-    $customers = aggregateCustomerStore($rawStore);
-
-    // Extract signals
-    $firstMessageBody = getFirstTicketMessageBody($api, $ticketId);
-    $callerPhone = extractCallerId($subject, $firstMessageBody);
-
-    $transcription = '';
-    if (!empty($event['transcriptions'])) {
-        $transcription = implode(' ', array_column($event['transcriptions'], 'text'));
-    }
-
-    $transcribedPhones = $transcription ? extractPhoneNumbers($transcription) : [];
-    $extractedAddresses = $transcription ? extractAddresses($transcription) : [];
-    $extractedNames = extractNames($transcription, $subject);
-
-    // Score all customers
-    $candidates = scoreCustomerCandidates(
-        $customers,
-        $callerPhone,
-        $transcribedPhones,
-        $extractedAddresses,
-        $extractedNames
-    );
-
-    // Filter to viable candidates (confidence >= 65%)
-    $viable = array_filter($candidates, fn($c) => $c['confidence'] >= 65);
-    usort($viable, fn($a, $b) => $b['confidence'] <=> $a['confidence']);
-
-    $matchCount = count($viable);
-
-    if ($matchCount >= 1) {
-        $top = $viable[0];
-        $topScore = $top['confidence'];
-        $secondScore = $viable[1]['confidence'] ?? 0;
-        $isTied = ($topScore === $secondScore);
-
-        // Clear winner criteria:
-        // 1. Top score >= 80%
-        // 2. Not tied with runner-up
-        // 3. Either a 10%+ lead over runner-up OR an exceptionally high score (>= 95%) with at least 5% lead
-        $isClearWinner = (!$isTied && $topScore >= 80 && ($topScore - $secondScore >= 10 || ($topScore >= 95 && $topScore - $secondScore >= 5)));
-
-        if ($isClearWinner) {
-            $assignedId = $top['customer_id'];
-            $assignedName = $top['customer_name'];
-            $reason = "{$topScore}% confidence via {$top['reason']}";
-
-            $result = $api->put("admin/support/tickets/{$ticketId}", [
-                'customer_id' => $assignedId,
-            ]);
-
-            if ($result !== null && $result !== false) {
-                logMsg("Match: Ticket #{$ticketId} — assigned to {$assignedName} (#{$assignedId}) [{$reason}]");
-
-                postMatchSuccessNote($api, $ticketId, $assignedId, $assignedName, $reason);
-
-                $event['customer_matched'] = [
-                    'customer_id'   => $assignedId,
-                    'customer_name' => $assignedName,
-                    'method'        => $reason,
-                ];
-                return;
-            }
-        }
-    }
-
-    // Suggested matches (1 to 3 candidates, including ties or close margins)
-    if ($matchCount >= 1 && $matchCount <= 3) {
-        logMsg("Match: Ticket #{$ticketId} — {$matchCount} suggested candidate(s) found (left unassigned).");
-
-        postSuggestedMatchesNote($api, $ticketId, array_slice($viable, 0, 3));
-
-        $candidateSummaries = array_map(function($c) {
-            return "{$c['customer_name']} (#{$c['customer_id']}, {$c['confidence']}%) [{$c['reason']}]";
-        }, array_slice($viable, 0, 3));
-
-        $event['customer_match_warning'] = ($matchCount === 1 ? "Suggested match: " : "Suggested matches: ")
-            . implode(' | ', $candidateSummaries);
-        return;
-    }
-
-    // More than 3 matches or no match (Unknown)
-    if ($matchCount > 3) {
-        logMsg("Match: Ticket #{$ticketId} — too many matches ({$matchCount} candidates). Left unassigned as unknown.");
-    } else {
-        logMsg("Match: Ticket #{$ticketId} — no viable customer matches found.");
-    }
-};
+}
 
 // ============================================================
-// Multi-Signal Scoring Engine
+// Multi-Signal Scoring Engine & Helper Functions
 // ============================================================
 
+if (!function_exists('scoreCustomerCandidates')) {
 function scoreCustomerCandidates(array $customers, ?string $callerPhone, array $spokenPhones, array $addresses, array $names): array
 {
     $scored = [];
@@ -172,6 +61,7 @@ function scoreCustomerCandidates(array $customers, ?string $callerPhone, array $
     foreach ($customers as $cid => $cust) {
         $bestScore = 0;
         $reasons = [];
+        $bestMatchedAddr = null;
 
         $allPhones = $cust['phones'] ?? [];
 
@@ -209,6 +99,7 @@ function scoreCustomerCandidates(array $customers, ?string $callerPhone, array $
                     if ($sim > $addrScore) {
                         $addrScore = $sim;
                         $addrReason = "address '{$inputAddr}' matched '{$custAddr}' (" . round($sim) . "%)";
+                        $bestMatchedAddr = $custAddr;
                     }
                 }
             }
@@ -279,22 +170,88 @@ function scoreCustomerCandidates(array $customers, ?string $callerPhone, array $
         }
 
         if ($bestScore >= 60) {
+            $primaryAddr = $bestMatchedAddr ?: (!empty($cust['addresses']) ? $cust['addresses'][0] : null);
             $scored[] = [
-                'customer_id'   => $cid,
-                'customer_name' => $cust['customer_name'],
-                'confidence'    => $bestScore,
-                'reason'        => implode('; ', $reasons),
+                'customer_id'     => $cid,
+                'customer_name'   => $cust['customer_name'],
+                'confidence'      => $bestScore,
+                'reason'          => implode('; ', $reasons),
+                'matched_address' => $primaryAddr,
+                'city'            => $cust['city'] ?? '',
             ];
         }
     }
 
     return $scored;
 }
+}
 
-// ============================================================
-// Database Frequency & Phonetic Helpers
-// ============================================================
+if (!function_exists('formatAddressWithTown')) {
+function formatAddressWithTown(?string $address, ?string $town): ?string
+{
+    $cleanAddr = '';
+    if (!empty($address)) {
+        $cleanAddr = trim(preg_replace('/\s+/', ' ', $address));
+        $cleanAddr = preg_replace('/\s+\d{4}$/', '', $cleanAddr);
+        $cleanAddr = rtrim($cleanAddr, " ,.");
+    }
 
+    $cleanTown = '';
+    if (!empty($town)) {
+        $cleanTown = trim(preg_replace('/\s+/', ' ', $town));
+        $cleanTown = preg_replace('/\s+\d{4}$/', '', $cleanTown);
+        $cleanTown = rtrim($cleanTown, " ,.");
+    }
+
+    if (!empty($cleanAddr) && !empty($cleanTown)) {
+        if (preg_match('/\b' . preg_quote($cleanTown, '/') . '\b/i', $cleanAddr)) {
+            return $cleanAddr;
+        }
+        return "{$cleanAddr}, {$cleanTown}";
+    }
+
+    if (!empty($cleanAddr)) {
+        return $cleanAddr;
+    }
+
+    if (!empty($cleanTown)) {
+        return $cleanTown;
+    }
+
+    return null;
+}
+}
+
+if (!function_exists('buildVoicemailSubject')) {
+function buildVoicemailSubject(int $ticketId, ?string $customerName = null, ?string $address = null, ?string $town = null, ?string $fromPhone = null): string
+{
+    $subject = "#{$ticketId} VOICEMAIL: caller";
+
+    if (!empty($customerName)) {
+        $subject .= " " . trim($customerName);
+        $location = formatAddressWithTown($address, $town);
+        if (!empty($location)) {
+            $subject .= " - {$location}";
+        }
+    } else {
+        $subject .= " unknown";
+    }
+
+    if (!empty($fromPhone)) {
+        $cleanPhone = preg_replace('/[\s\-()]/', '', $fromPhone);
+        if (preg_match('/\d{6,}/', $cleanPhone)) {
+            if (preg_match('/^\+?64(\d+)$/', $cleanPhone, $pm)) {
+                $cleanPhone = '0' . $pm[1];
+            }
+            $subject .= " FROM {$cleanPhone}";
+        }
+    }
+
+    return $subject;
+}
+}
+
+if (!function_exists('getCommonWordBlacklist')) {
 function getCommonWordBlacklist(): array
 {
     return [
@@ -307,13 +264,18 @@ function getCommonWordBlacklist(): array
         'calling', 'making', 'leaving', 'testing', 'checking', 'trying', 'speaking', 'ringing',
         'message', 'call', 'voicemail', 'ticket', 'phone', 'wifi', 'internet', 'modem',
         'anonymous', 'unknown', 'caller', 'wireless', 'splynx', 'support', 'restricted', 'private', 'none', 'user',
-        'way', 'road', 'street', 'drive', 'avenue', 'place', 'lane', 'close', 'court', 'terrace'
+        'way', 'road', 'street', 'drive', 'avenue', 'place', 'lane', 'close', 'court', 'terrace',
+        'good', 'morning', 'afternoon', 'evening', 'night', 'today', 'tomorrow', 'yesterday',
+        'hello', 'hi', 'hey', 'um', 'uh', 'ah', 'er', 'ok', 'okay', 'yeah', 'yep', 'nope', 'well', 'so',
+        'thank', 'thanks', 'please', 'sorry', 'test', 'pertaining', 'regarding', 'regards', 'cheers',
+        'new', 'zealand', 'service', 'services', 'account', 'number', 'address', 'monday', 'tuesday', 'wednesday',
+        'thursday', 'friday', 'saturday', 'sunday', 'january', 'february', 'march', 'april', 'may', 'june',
+        'july', 'august', 'september', 'october', 'november', 'december'
     ];
 }
+}
 
-/**
- * Counts how many customers have this name token (first name or surname).
- */
+if (!function_exists('countFirstNameOccurrences')) {
 function countFirstNameOccurrences(array $customers, string $nameToken): array
 {
     $tokenLower = strtolower(trim($nameToken));
@@ -358,7 +320,9 @@ function countFirstNameOccurrences(array $customers, string $nameToken): array
 
     return $matches;
 }
+}
 
+if (!function_exists('isNameWordMatch')) {
 function isNameWordMatch(string $word, string $target): bool
 {
     $w = strtolower(trim($word));
@@ -369,12 +333,10 @@ function isNameWordMatch(string $word, string $target): bool
     $blacklist = getCommonWordBlacklist();
     if (in_array($w, $blacklist) || in_array($t, $blacklist)) return false;
 
-    // Words with length <= 4 require exact match (prevents that vs thad, rob vs bob)
     if (strlen($w) <= 4 && strlen($t) <= 4) {
         return false;
     }
 
-    // Typo check for length >= 5 (must share first letter and have >= 85% similarity)
     if (levenshtein($w, $t) <= 1 && $w[0] === $t[0]) {
         similar_text($w, $t, $pct);
         if ($pct >= 85) {
@@ -382,8 +344,6 @@ function isNameWordMatch(string $word, string $target): bool
         }
     }
 
-    // Phonetic equality check: MUST have both matching metaphone AND >= 85% similarity
-    // (prevents Peter [80%] from colliding with Petra)
     $wMeta = metaphone($w);
     $tMeta = metaphone($t);
     if ($wMeta && $wMeta === $tMeta) {
@@ -395,7 +355,9 @@ function isNameWordMatch(string $word, string $target): bool
 
     return false;
 }
+}
 
+if (!function_exists('evaluateAddressSimilarity')) {
 function evaluateAddressSimilarity(string $input, string $target): float
 {
     $inNorm = normalizeAddress($input);
@@ -466,7 +428,9 @@ function evaluateAddressSimilarity(string $input, string $target): float
 
     return 72.0;
 }
+}
 
+if (!function_exists('evaluateNameSimilarity')) {
 function evaluateNameSimilarity(string $searchName, string $targetName, bool $isFullName): float
 {
     $searchLower = strtolower(trim($searchName));
@@ -511,7 +475,9 @@ function evaluateNameSimilarity(string $searchName, string $targetName, bool $is
 
     return 0.0;
 }
+}
 
+if (!function_exists('normalizeAddress')) {
 function normalizeAddress(string $addr): string
 {
     $a = strtolower(trim($addr));
@@ -525,11 +491,9 @@ function normalizeAddress(string $addr): string
     $a = preg_replace(array_keys($replacements), array_values($replacements), $a);
     return preg_replace('/\s+/', ' ', $a);
 }
+}
 
-// ============================================================
-// Internal Note & Ticket Helpers
-// ============================================================
-
+if (!function_exists('postMatchSuccessNote')) {
 function postMatchSuccessNote(SplynxApiClient $api, int $ticketId, int $customerId, string $customerName, string $reason): void
 {
     global $noteAuthorId, $splynxAdminUrl;
@@ -546,7 +510,9 @@ function postMatchSuccessNote(SplynxApiClient $api, int $ticketId, int $customer
         'admin_id'     => $noteAuthorId ?? 1,
     ]);
 }
+}
 
+if (!function_exists('postSuggestedMatchesNote')) {
 function postSuggestedMatchesNote(SplynxApiClient $api, int $ticketId, array $candidates): void
 {
     global $noteAuthorId, $splynxAdminUrl;
@@ -555,10 +521,11 @@ function postSuggestedMatchesNote(SplynxApiClient $api, int $ticketId, array $ca
     $count = count($candidates);
     $title = ($count === 1) ? "Suggested Customer Match" : "Suggested Customer Matches ({$count} candidates)";
 
-    $noteBody = "<p>💡 <strong>{$title}:</strong> Left unassigned (confidence below 80%). Potential match(es) detected:</p><ul>";
+    $noteBody = "<p>💡 <strong>{$title}:</strong> Left unassigned (did not meet auto-assign criteria). Potential match(es) detected:</p><ul>";
     foreach ($candidates as $c) {
+        $cName = !empty($c['customer_name']) ? $c['customer_name'] : "Customer #{$c['customer_id']}";
         $custUrl = $adminUrl ? "{$adminUrl}/admin/customers/view?id={$c['customer_id']}" : "#";
-        $noteBody .= "<li><a href=\"{$custUrl}\"><strong>" . htmlspecialchars($c['customer_name']) . " (#{$c['customer_id']})</strong></a> "
+        $noteBody .= "<li><a href=\"{$custUrl}\"><strong>" . htmlspecialchars($cName) . " (#{$c['customer_id']})</strong></a> "
             . "— <em>Confidence: {$c['confidence']}%</em> (" . htmlspecialchars($c['reason']) . ")</li>";
     }
     $noteBody .= "</ul><p><em>Click a customer above to review and manually assign if correct.</em></p>";
@@ -570,7 +537,9 @@ function postSuggestedMatchesNote(SplynxApiClient $api, int $ticketId, array $ca
         'admin_id'     => $noteAuthorId ?? 1,
     ]);
 }
+}
 
+if (!function_exists('aggregateCustomerStore')) {
 function aggregateCustomerStore(array $dataStore): array
 {
     $customers = [];
@@ -587,6 +556,7 @@ function aggregateCustomerStore(array $dataStore): array
                 'contact_2_phone' => $entry['contact_2_phone'] ?? '',
                 'addresses'       => [],
                 'phones'          => [],
+                'city'            => '',
             ];
         }
 
@@ -595,6 +565,15 @@ function aggregateCustomerStore(array $dataStore): array
         }
         if (empty($customers[$cid]['contact_2_name']) && !empty($entry['contact_2_name'])) {
             $customers[$cid]['contact_2_name'] = $entry['contact_2_name'];
+        }
+
+        if (empty($customers[$cid]['city'])) {
+            foreach (['service_city', 'city', 'customer_city', 'town', 'service_town', 'billing_city'] as $ck) {
+                if (!empty($entry[$ck])) {
+                    $customers[$cid]['city'] = trim($entry[$ck]);
+                    break;
+                }
+            }
         }
 
         foreach (['customer_phone', 'contact_2_phone'] as $pk) {
@@ -619,7 +598,9 @@ function aggregateCustomerStore(array $dataStore): array
 
     return $customers;
 }
+}
 
+if (!function_exists('getFirstTicketMessageBody')) {
 function getFirstTicketMessageBody(SplynxApiClient $api, int $ticketId): string
 {
     $messages = $api->get("admin/support/ticket-messages", [
@@ -629,7 +610,9 @@ function getFirstTicketMessageBody(SplynxApiClient $api, int $ticketId): string
     $first = reset($messages);
     return strip_tags($first['message'] ?? '');
 }
+}
 
+if (!function_exists('extractCallerId')) {
 function extractCallerId(string $subject, string $body = ''): ?string
 {
     if ($body && preg_match('/From:\s*([+\d(][\d\s\-().]{5,})/i', $body, $m)) {
@@ -646,7 +629,9 @@ function extractCallerId(string $subject, string $body = ''): ?string
     }
     return null;
 }
+}
 
+if (!function_exists('extractPhoneNumbers')) {
 function extractPhoneNumbers(string $text): array
 {
     $phones = [];
@@ -660,21 +645,25 @@ function extractPhoneNumbers(string $text): array
     }
     return array_unique($phones);
 }
+}
 
+if (!function_exists('getHonorificTitlePattern')) {
 function getHonorificTitlePattern(): string
 {
     return '(?:mr|mrs|ms|miss|dr|doctor|prof|professor|rev|reverend|reverand|pastor|fr|father|det|detective|sgt|sergeant|sargent|sargeant|constable|cst|inspector|insp|capt|captain|officer|sir|dame)';
 }
+}
 
+if (!function_exists('extractNames')) {
 function extractNames(string $transcription, string $subject): array
 {
     $names = [];
     $blacklist = getCommonWordBlacklist();
     $titles = getHonorificTitlePattern();
-    $stopWords = ['from', 'at', 'in', 'on', 'near', 'with', 'about', 'and', 'making', 'calling', 'leaving', 'testing', 'checking', 'trying', 'here', 'speaking'];
+    $stopWords = ['from', 'at', 'in', 'on', 'near', 'with', 'about', 'and', 'making', 'calling', 'leaving', 'testing', 'checking', 'trying', 'here', 'speaking', 'pertaining', 'regarding', 'to', 'the', 'a', 'an'];
 
-    // 1. From subject (reject candidates containing digits or blacklist words)
-    if (preg_match("/from\\s+(?:caller\\s+)?([A-Za-z0-9\\s.,'-]+?)(?:\\s*\\(|\\s*$)/i", $subject, $m)) {
+    // 1. From subject
+    if (preg_match("/from\s+(?:caller\s+)?([A-Za-z0-9\s.,'-]+?)(?:\s*\(|\s*$)/i", $subject, $m)) {
         $raw = trim($m[1]);
         $clean = preg_replace('/^(?:' . $titles . ')\.?\s+/i', '', $raw);
         if (!preg_match('/\d/', $clean)) {
@@ -690,20 +679,26 @@ function extractNames(string $transcription, string $subject): array
         }
     }
 
-    // 2. Direct title match anywhere in speech: 'Mr. Greg', 'Detective Miller'
-    if (preg_match_all('/\b(?:' . $titles . ')\.?\s+([A-Z][a-z]+)/', $transcription, $tm)) {
+    // 2. Direct title match anywhere in speech
+    if (preg_match_all('/\b(?:' . $titles . ')\.?\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/', $transcription, $tm)) {
         foreach ($tm[1] as $tn) {
             $clean = trim($tn, " .,!?:;");
-            $cleanLower = strtolower($clean);
-            if (strlen($clean) > 2 && !in_array($cleanLower, $blacklist) && !in_array($cleanLower, $stopWords)) {
-                $names[] = ['name' => $clean, 'is_full' => false];
+            $cleanWords = preg_split('/\s+/', $clean);
+            $valid = true;
+            foreach ($cleanWords as $cw) {
+                $cwL = strtolower($cw);
+                if (in_array($cwL, $blacklist) || in_array($cwL, $stopWords)) { $valid = false; break; }
+            }
+            if ($valid && strlen($clean) > 2) {
+                $isFull = count($cleanWords) >= 2;
+                $names[] = ['name' => $clean, 'is_full' => $isFull];
             }
         }
     }
 
-    // 3. From speech introductions: 'this is Petra', 'it is John Smith'
-    $pattern = "/(?:it'?s|this is|my name is|i'?m)\\s+(?:{$titles}\\.?\\s+)?([A-Z][a-z]+(?:\\s+[A-Z][a-z]+)*)/i";
-    if (preg_match_all($pattern, $transcription, $matches)) {
+    // 3. Spoken introductions: 'from Gemma Seddon', 'this is John Smith', 'my name is Petra', 'I am Gemma'
+    $introPattern = "/(?:\b(?:from|call\s+from|calling\s+from|message\s+from|it'?s|it\s+is|this is|this was|my name is|my name's|i'?m|i\s+am|name is|name's)\s+)(?:{$titles}\.?\s+)?([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/i";
+    if (preg_match_all($introPattern, $transcription, $matches)) {
         foreach ($matches[1] as $n) {
             $n = trim($n, " .,!?:;");
             $words = preg_split('/\s+/', $n);
@@ -726,6 +721,51 @@ function extractNames(string $transcription, string $subject): array
         }
     }
 
+    // 4. Spoken suffixes: 'Gemma Seddon here', 'John Smith calling', 'Petra speaking'
+    $suffixPattern = '/\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:here|speaking|calling)\b/i';
+    if (preg_match_all($suffixPattern, $transcription, $sm)) {
+        foreach ($sm[1] as $n) {
+            $n = trim($n, " .,!?:;");
+            $words = preg_split('/\s+/', $n);
+            $cleanWords = [];
+            foreach ($words as $w) {
+                $wLower = strtolower($w);
+                if (in_array($wLower, $stopWords) || in_array($wLower, $blacklist)) {
+                    break;
+                }
+                $cleanWords[] = $w;
+            }
+
+            if (!empty($cleanWords)) {
+                $cleanName = implode(' ', $cleanWords);
+                if (strlen($cleanName) > 2 && !preg_match('/\d/', $cleanName) && !in_array(strtolower($cleanName), $blacklist)) {
+                    $isFull = count($cleanWords) >= 2;
+                    $names[] = ['name' => $cleanName, 'is_full' => $isFull];
+                }
+            }
+        }
+    }
+
+    // 5. Standalone Title Case 2-to-3 word names (with greeting lookahead guard)
+    $leadBlock = '(?:Hi|Hey|Hello|Dear|Good|Morning|Afternoon|Evening|Night|Today|Tomorrow|Yesterday|Test|Voice|Message|New|Zealand|Please|Thank|Thanks|Sorry)';
+    if (preg_match_all('/\b(?!\b' . $leadBlock . '\b)([A-Z][a-z]{1,}\s+[A-Z][a-z]{1,}(?:\s+[A-Z][a-z]{1,})?)\b/', $transcription, $standMatches)) {
+        foreach ($standMatches[1] as $sn) {
+            $sn = trim($sn, " .,!?:;");
+            $words = preg_split('/\s+/', $sn);
+            $valid = true;
+            foreach ($words as $w) {
+                $wLower = strtolower($w);
+                if (in_array($wLower, $stopWords) || in_array($wLower, $blacklist)) {
+                    $valid = false;
+                    break;
+                }
+            }
+            if ($valid && count($words) >= 2) {
+                $names[] = ['name' => $sn, 'is_full' => true];
+            }
+        }
+    }
+
     $unique = [];
     foreach ($names as $item) {
         $k = strtolower($item['name']);
@@ -735,7 +775,9 @@ function extractNames(string $transcription, string $subject): array
     }
     return array_values($unique);
 }
+}
 
+if (!function_exists('extractAddresses')) {
 function extractAddresses(string $transcription): array
 {
     $addresses = [];
@@ -753,7 +795,9 @@ function extractAddresses(string $transcription): array
 
     return array_values(array_unique($addresses));
 }
+}
 
+if (!function_exists('cleanAddressString')) {
 function cleanAddressString(string $addr): ?string
 {
     $a = trim($addr, " .,!?:;");
@@ -774,7 +818,9 @@ function cleanAddressString(string $addr): ?string
 
     return (strlen($a) > 5) ? $a : null;
 }
+}
 
+if (!function_exists('phoneSearchVariants')) {
 function phoneSearchVariants(string $phone): array
 {
     $stripped = preg_replace('/[\s\-()]+/', '', $phone);
@@ -791,7 +837,9 @@ function phoneSearchVariants(string $phone): array
     }
     return array_unique($variants);
 }
+}
 
+if (!function_exists('phoneMatchesAny')) {
 function phoneMatchesAny(string $haystack, array $variants): bool
 {
     if (empty($haystack)) return false;
@@ -803,3 +851,179 @@ function phoneMatchesAny(string $haystack, array $variants): bool
     }
     return false;
 }
+}
+
+// ============================================================
+// Main Handler Closure (returned to poll.php / dispatcher)
+// ============================================================
+
+return function (array &$event, SplynxApiClient $api) {
+    if ($event['type'] !== 'new_ticket') return;
+
+    global $matchGenericCustomerIds, $matchSubjectPattern;
+
+    $ticket = $event['ticket'];
+    $ticketId = (int)$ticket['id'];
+    $customerId = (int)($ticket['customer_id'] ?? 0);
+    $subject = $ticket['subject'] ?? '';
+
+    // Only process if unassigned or generic
+    if ($customerId !== 0 && !in_array($customerId, $matchGenericCustomerIds ?? [])) {
+        return;
+    }
+
+    $pattern = $matchSubjectPattern ?? '/voicemail|voice message/i';
+    if (!preg_match($pattern, $subject)) {
+        return;
+    }
+
+    logMsg("Match: Ticket #{$ticketId} — evaluating customer match candidates");
+
+    if (!file_exists(MATCH_DATA_STORE)) {
+        logMsg("Match: Data store not available at " . MATCH_DATA_STORE);
+        return;
+    }
+    $rawStore = json_decode(file_get_contents(MATCH_DATA_STORE), true);
+    if (empty($rawStore)) {
+        logMsg("Match: Data store is empty");
+        return;
+    }
+
+    // Aggregate store by unique customer_id (merging all services, phones, addresses)
+    $customers = aggregateCustomerStore($rawStore);
+
+    // Extract signals
+    $firstMessageBody = getFirstTicketMessageBody($api, $ticketId);
+    $callerPhone = extractCallerId($subject, $firstMessageBody);
+
+    $transcription = '';
+    if (!empty($event['transcriptions'])) {
+        $transcription = implode(' ', array_column($event['transcriptions'], 'text'));
+    }
+
+    $transcribedPhones = $transcription ? extractPhoneNumbers($transcription) : [];
+    $extractedAddresses = $transcription ? extractAddresses($transcription) : [];
+    $extractedNames = extractNames($transcription, $subject);
+
+    // Identify from phone (prefer caller ID, fallback to spoken phone)
+    $fromPhone = $callerPhone ?: (!empty($transcribedPhones) ? $transcribedPhones[0] : null);
+
+    // Score all customers
+    $candidates = scoreCustomerCandidates(
+        $customers,
+        $callerPhone,
+        $transcribedPhones,
+        $extractedAddresses,
+        $extractedNames
+    );
+
+    // Filter to viable candidates (confidence >= 65%)
+    $viable = array_filter($candidates, fn($c) => $c['confidence'] >= 65);
+    usort($viable, fn($a, $b) => $b['confidence'] <=> $a['confidence']);
+
+    $matchCount = count($viable);
+
+    if ($matchCount >= 1) {
+        $top = $viable[0];
+        $topScore = $top['confidence'];
+        $secondScore = $viable[1]['confidence'] ?? 0;
+        $isTied = ($topScore === $secondScore);
+
+        // Clear winner criteria:
+        // 1. Top score >= 80%
+        // 2. Not tied with runner-up
+        // 3. Either a 10%+ lead over runner-up OR an exceptionally high score (>= 95%) with at least 5% lead
+        $isClearWinner = (!$isTied && $topScore >= 80 && ($topScore - $secondScore >= 10 || ($topScore >= 95 && $topScore - $secondScore >= 5)));
+
+        if ($isClearWinner) {
+            $assignedId = $top['customer_id'];
+            $assignedName = !empty($top['customer_name']) ? $top['customer_name'] : "Customer #{$assignedId}";
+            $assignedAddress = $top['matched_address'] ?? null;
+            $assignedTown = $top['city'] ?? ($customers[$assignedId]['city'] ?? null);
+
+            // If town not found in cache or name is generic, lookup customer directly via Splynx API
+            if (empty($assignedTown) || $assignedName === "Customer #{$assignedId}") {
+                $custDetails = $api->get("admin/customers/customer/{$assignedId}");
+                if (is_array($custDetails)) {
+                    if (empty($assignedTown)) {
+                        $assignedTown = $custDetails['city'] ?? ($custDetails['billing_city'] ?? null);
+                    }
+                    if ($assignedName === "Customer #{$assignedId}" && !empty($custDetails['name'])) {
+                        $assignedName = trim($custDetails['name'] . ' ' . ($custDetails['surname'] ?? ''));
+                    }
+                }
+            }
+
+            $reason = "{$topScore}% confidence via {$top['reason']}";
+
+            $newSubject = buildVoicemailSubject($ticketId, $assignedName, $assignedAddress, $assignedTown, $fromPhone);
+
+            $updateData = [
+                'customer_id' => $assignedId,
+            ];
+            if ($subject !== $newSubject) {
+                $updateData['subject'] = $newSubject;
+            }
+
+            $result = $api->put("admin/support/tickets/{$ticketId}", $updateData);
+
+            if ($result !== null && $result !== false) {
+                $ticket['subject'] = $newSubject;
+                $event['ticket']['subject'] = $newSubject;
+
+                logMsg("Match: Ticket #{$ticketId} — assigned to {$assignedName} (#{$assignedId}) [{$reason}]");
+                if (isset($updateData['subject'])) {
+                    logMsg("Match: Ticket #{$ticketId} — updated subject to \"{$newSubject}\"");
+                }
+
+                postMatchSuccessNote($api, $ticketId, $assignedId, $assignedName, $reason);
+
+                $event['customer_matched'] = [
+                    'customer_id'   => $assignedId,
+                    'customer_name' => $assignedName,
+                    'method'        => $reason,
+                ];
+                return;
+            }
+
+            logMsg("Match: Ticket #{$ticketId} — assignment PUT failed for {$assignedName} (#{$assignedId}); skipping unknown subject rewrite to avoid inconsistent state.");
+            return;
+        }
+    }
+
+    // If not a clear winner, update subject to caller unknown format
+    $unknownSubject = buildVoicemailSubject($ticketId, null, null, null, $fromPhone);
+    if ($subject !== $unknownSubject) {
+        $updateRes = $api->put("admin/support/tickets/{$ticketId}", [
+            'subject' => $unknownSubject,
+        ]);
+        if ($updateRes !== null && $updateRes !== false) {
+            $ticket['subject'] = $unknownSubject;
+            $event['ticket']['subject'] = $unknownSubject;
+            logMsg("Match: Ticket #{$ticketId} — updated subject to \"{$unknownSubject}\"");
+        }
+    }
+
+    // Suggested matches (1 to 3 candidates, including ties or close margins)
+    if ($matchCount >= 1 && $matchCount <= 3) {
+        logMsg("Match: Ticket #{$ticketId} — {$matchCount} suggested candidate(s) found (left unassigned).");
+
+        postSuggestedMatchesNote($api, $ticketId, array_slice($viable, 0, 3));
+
+        $candidateSummaries = array_map(function($c) {
+            $cName = !empty($c['customer_name']) ? $c['customer_name'] : "Customer #{$c['customer_id']}";
+            return "{$cName} (#{$c['customer_id']}, {$c['confidence']}%) [{$c['reason']}]";
+        }, array_slice($viable, 0, 3));
+
+        $event['customer_match_warning'] = ($matchCount === 1 ? "Suggested match: " : "Suggested matches: ")
+            . implode(' | ', $candidateSummaries);
+        return;
+    }
+
+    // More than 3 matches or no match (Unknown)
+    if ($matchCount > 3) {
+        logMsg("Match: Ticket #{$ticketId} — too many matches ({$matchCount} candidates). Left unassigned as unknown.");
+    } else {
+        logMsg("Match: Ticket #{$ticketId} — no viable customer matches found.");
+    }
+};
