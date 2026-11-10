@@ -23,14 +23,32 @@ return function (array &$event, SplynxApiClient $api) {
     global $audioExtensions, $maxAudioSize, $splynxBaseUrl, $notePrefix, $noteAuthorId;
 
     $ticket = $event['ticket'];
-    $ticketId = $ticket['id'];
+    $ticketId = (int)$ticket['id'];
 
     $audioFiles = findAudioAttachments($api, $ticketId);
     if (empty($audioFiles)) return;
 
     logMsg("Transcribe: Ticket #{$ticketId} has " . count($audioFiles) . " audio attachment(s)");
 
+    // Fetch existing notes once to ensure idempotency and prevent duplicate transcriptions
+    $existingNotes = $api->get("admin/support/ticket-messages", [
+        'main_attributes' => ['ticket_id' => $ticketId, 'message_type' => 'note'],
+    ]);
+
     foreach ($audioFiles as $audio) {
+        $filename = $audio['filename'];
+
+        // Guard: skip if a note for this audio file was already posted
+        if (is_array($existingNotes)) {
+            foreach ($existingNotes as $note) {
+                $noteMsg = $note['message'] ?? '';
+                if (stripos($noteMsg, $filename) !== false && stripos($noteMsg, 'Voicemail Transcription') !== false) {
+                    logMsg("Transcribe: Note for {$filename} already exists on ticket #{$ticketId}, skipping");
+                    continue 2;
+                }
+            }
+        }
+
         $transcription = attemptTranscription($api, $ticketId, $audio);
 
         if ($transcription !== false) {
@@ -134,6 +152,21 @@ function processRetries(SplynxApiClient $api)
             continue;
         }
 
+        // Check if note was already posted in the meantime
+        $existingNotes = $api->get("admin/support/ticket-messages", [
+            'main_attributes' => ['ticket_id' => $item['ticket_id'], 'message_type' => 'note'],
+        ]);
+        if (is_array($existingNotes)) {
+            foreach ($existingNotes as $note) {
+                $noteMsg = $note['message'] ?? '';
+                if (stripos($noteMsg, $item['filename']) !== false && stripos($noteMsg, 'Voicemail Transcription') !== false) {
+                    logMsg("Transcribe: Retry for {$item['filename']} on ticket #{$item['ticket_id']} skipped (note already exists)");
+                    $completed[] = $key;
+                    continue 2;
+                }
+            }
+        }
+
         logMsg("Transcribe: Retry #{$item['attempts']} for ticket #{$item['ticket_id']} {$item['filename']}");
 
         $audio = [
@@ -195,7 +228,6 @@ function sendTranscriptionSlack(int $ticketId, string $subject, string $filename
     if (empty($slackWebhookUrl) || strpos($slackWebhookUrl, 'YOUR') !== false) return;
 
     $ticketUrl = rtrim($splynxAdminUrl, '/') . "/admin/tickets/opened--view?id={$ticketId}";
-
     $title = preg_match('/^#\d+\b/', $subject) ? $subject : "#{$ticketId} {$subject}";
 
     $text = ":studio_microphone: *Voicemail Transcription* — <{$ticketUrl}|{$title}>"

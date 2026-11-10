@@ -18,6 +18,13 @@
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/SplynxApiClient.php';
 
+// Prevent overlapping cron runs (avoids race condition when transcription takes >60s)
+$lockFile = sys_get_temp_dir() . '/splynx_ticket_events.lock';
+$lockFp = fopen($lockFile, 'c');
+if (!$lockFp || !flock($lockFp, LOCK_EX | LOCK_NB)) {
+    exit(0); // Another poll process is currently active
+}
+
 $api = new SplynxApiClient($splynxBaseUrl, $apiKey, $apiSecret);
 
 // Load registered handlers
@@ -129,8 +136,6 @@ foreach ($tickets as $ticket) {
     }
 
     // --- Ticket assigned or reassigned ---
-    // Requires 'assigned_to' to pre-exist in prevState (migration-safe against deploy storms)
-    // and verifies that the ticket was recently updated
     $updatedTime = strtotime($updatedAt);
     $isRecentlyUpdated = ($updatedTime && ($now - $updatedTime) < $lookbackSeconds);
 
@@ -156,7 +161,6 @@ foreach ($tickets as $ticket) {
 }
 
 // --- Dispatch events to handlers ---
-// Handlers receive $event by reference so earlier handlers can enrich it
 $dispatched = 0;
 foreach ($events as &$event) {
     $ticketId = $event['ticket']['id'];
@@ -199,10 +203,6 @@ if (isset($activeHandlers['transcribe']) && function_exists('processRetries')) {
 // Core Functions
 // ============================================================
 
-/**
- * Load enabled handler files from the handlers/ directory.
- * Each handler file must return a callable.
- */
 function loadHandlers(array $handlerConfig): array
 {
     $loaded = [];
@@ -236,7 +236,6 @@ function isIgnoredTicket(array $ticket): bool
     $reporterType = $ticket['reporter_type'] ?? '';
     $reporterId = (int)($ticket['reporter_id'] ?? 0);
 
-    // Admin-created
     if ($reporterType === 'admin') {
         if (!empty($ignoreAdminCreators)) {
             return $reporterId > 0 && in_array($reporterId, $ignoreAdminCreators);
@@ -244,7 +243,6 @@ function isIgnoredTicket(array $ticket): bool
         return true;
     }
 
-    // API-created
     if ($reporterType === 'api') {
         if (!empty($ignoreApiCreators)) {
             return $reporterId > 0 && in_array($reporterId, $ignoreApiCreators);
@@ -252,7 +250,6 @@ function isIgnoredTicket(array $ticket): bool
         return true;
     }
 
-    // Ignored incoming customers
     if (!empty($ignoreIncomingCustomerIds)) {
         $incomingId = (int)($ticket['incoming_customer_id'] ?? 0);
         if ($incomingId > 0 && in_array($incomingId, $ignoreIncomingCustomerIds)) {
@@ -269,5 +266,4 @@ function logMsg(string $msg): void
     $ts = date('Y-m-d H:i:s');
     $line = "[{$ts}] {$msg}\n";
     file_put_contents($logFile, $line, FILE_APPEND);
-    // Note: avoided echo here to prevent duplicate log entries when cron redirects stdout (>> events.log)
 }
